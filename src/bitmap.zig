@@ -861,7 +861,7 @@ pub const RoaringBitmap = struct {
                 const result_tp = result.toTagged();
 
                 // Check if a new container was allocated (e.g., array converted to bitset)
-                const is_same = (@as(u64, @bitCast(result_tp)) == @as(u64, @bitCast(self.containers[i])));
+                const is_same = TaggedPtr.eql(result_tp, self.containers[i]);
                 if (!is_same) {
                     // New container allocated, free the old one
                     old_container.deinit(self.allocator);
@@ -1388,6 +1388,17 @@ pub const RoaringBitmap = struct {
     /// Serialize to any writer.
     pub fn serializeToWriter(self: *const Self, writer: anytype) !void {
         return ser.serializeToWriter(self, writer);
+    }
+
+    /// Serialize into a caller-provided buffer.
+    /// Returns number of bytes written.
+    pub fn serializeIntoBuffer(self: *const Self, out: []u8) !usize {
+        const required = ser.serializedSizeInBytes(self);
+        if (out.len < required) return error.NoSpaceLeft;
+
+        var stream = std.io.fixedBufferStream(out[0..required]);
+        try ser.serializeToWriter(self, stream.writer());
+        return required;
     }
 
     /// Deserialize a bitmap from bytes (RoaringFormatSpec compatible).

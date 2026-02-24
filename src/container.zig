@@ -4,10 +4,12 @@ const BitsetContainer = @import("bitset_container.zig").BitsetContainer;
 const RunContainer = @import("run_container.zig").RunContainer;
 
 /// Tagged pointer encoding for containers.
-/// Low 2 bits encode the container type (pointers are at least 8-byte aligned).
-pub const TaggedPtr = packed struct(u64) {
-    tag: ContainerType,
-    addr: u62,
+/// Low 2 bits encode the container type (pointers are at least 4-byte aligned).
+pub const TaggedPtr = struct {
+    raw: usize,
+
+    const TAG_BITS: usize = 2;
+    const TAG_MASK: usize = (1 << TAG_BITS) - 1;
 
     pub const ContainerType = enum(u2) {
         array = 0b00,
@@ -29,31 +31,36 @@ pub const TaggedPtr = packed struct(u64) {
     }
 
     fn init(ptr: anytype, tag: ContainerType) TaggedPtr {
-        const raw = @intFromPtr(ptr);
-        std.debug.assert(raw & 0x3 == 0); // must be 4-byte aligned minimum
-        return .{
-            .tag = tag,
-            .addr = @truncate(raw >> 2),
-        };
+        const ptr_bits = @intFromPtr(ptr);
+        std.debug.assert((ptr_bits & TAG_MASK) == 0);
+        return .{ .raw = ptr_bits | @intFromEnum(tag) };
     }
 
     pub fn getArray(self: TaggedPtr) *ArrayContainer {
-        std.debug.assert(self.tag == .array);
-        return @ptrFromInt(@as(u64, self.addr) << 2);
+        std.debug.assert(self.getType() == .array);
+        return @ptrFromInt(self.ptrBits());
     }
 
     pub fn getBitset(self: TaggedPtr) *BitsetContainer {
-        std.debug.assert(self.tag == .bitset);
-        return @ptrFromInt(@as(u64, self.addr) << 2);
+        std.debug.assert(self.getType() == .bitset);
+        return @ptrFromInt(self.ptrBits());
     }
 
     pub fn getRun(self: TaggedPtr) *RunContainer {
-        std.debug.assert(self.tag == .run);
-        return @ptrFromInt(@as(u64, self.addr) << 2);
+        std.debug.assert(self.getType() == .run);
+        return @ptrFromInt(self.ptrBits());
     }
 
     pub fn getType(self: TaggedPtr) ContainerType {
-        return self.tag;
+        return @enumFromInt(@as(u2, @truncate(self.raw & TAG_MASK)));
+    }
+
+    pub fn eql(a: TaggedPtr, b: TaggedPtr) bool {
+        return a.raw == b.raw;
+    }
+
+    fn ptrBits(self: TaggedPtr) usize {
+        return self.raw & ~TAG_MASK;
     }
 };
 
@@ -68,7 +75,7 @@ pub const Container = union(TaggedPtr.ContainerType) {
 
     /// Create from a tagged pointer.
     pub fn fromTagged(tp: TaggedPtr) Self {
-        return switch (tp.tag) {
+        return switch (tp.getType()) {
             .array => .{ .array = tp.getArray() },
             .bitset => .{ .bitset = tp.getBitset() },
             .run => .{ .run = tp.getRun() },
