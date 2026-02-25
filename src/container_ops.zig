@@ -670,6 +670,376 @@ fn runIntersectsRun(a: *RunContainer, b: *RunContainer) bool {
 }
 
 // ============================================================================
+// Frozen Container Intersection (zero-allocation, operates on raw bytes)
+// ============================================================================
+
+/// Container kind for frozen (serialized) containers.
+pub const FrozenContainerKind = enum { array, bitset, run };
+
+/// Read a little-endian u16 at the given element index from raw bytes.
+inline fn readFrozenU16(data: []const u8, index: usize) u16 {
+    const offset = index * 2;
+    return std.mem.readInt(u16, data[offset..][0..2], .little);
+}
+
+/// Read a little-endian u64 word at the given word index from raw bytes.
+inline fn readFrozenWord(data: []const u8, word_idx: usize) u64 {
+    const offset = word_idx * 8;
+    return std.mem.readInt(u64, data[offset..][0..8], .little);
+}
+
+/// Gallop search on a frozen (serialized) sorted u16 array.
+/// Returns the index of the first element >= target.
+fn frozenGallopSearch(data: []const u8, card: u32, target: u16, start: usize) usize {
+    if (start >= card) return card;
+
+    var step: usize = 1;
+    var hi = start;
+    while (hi < card and readFrozenU16(data, hi) < target) {
+        hi += step;
+        step *= 2;
+    }
+    if (hi > card) hi = card;
+
+    var lo = if (step > 2) hi -| (step / 2) else start;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (readFrozenU16(data, mid) < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// Binary search through frozen run container data for a value.
+/// run_data starts at the n_runs u16 prefix.
+fn frozenRunContains(run_data: []const u8, n_runs: u16, value: u16) bool {
+    var lo: u16 = 0;
+    var hi: u16 = n_runs;
+
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const offset = 2 + @as(usize, mid) * 4;
+        const start = std.mem.readInt(u16, run_data[offset..][0..2], .little);
+        const length = std.mem.readInt(u16, run_data[offset + 2 ..][0..2], .little);
+        const end = start +| length;
+
+        if (end < value) {
+            lo = mid + 1;
+        } else if (start > value) {
+            hi = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Compute |a ∩ b| for two frozen containers without allocation.
+pub fn frozenContainerIntersectionCardinality(
+    a_kind: FrozenContainerKind,
+    a_data: []const u8,
+    a_card: u32,
+    b_kind: FrozenContainerKind,
+    b_data: []const u8,
+    b_card: u32,
+) u64 {
+    return switch (a_kind) {
+        .array => switch (b_kind) {
+            .array => frozenArrayIntersectArrayCard(a_data, a_card, b_data, b_card),
+            .bitset => frozenArrayIntersectBitsetCard(a_data, a_card, b_data),
+            .run => frozenArrayIntersectRunCard(a_data, a_card, b_data),
+        },
+        .bitset => switch (b_kind) {
+            .array => frozenArrayIntersectBitsetCard(b_data, b_card, a_data),
+            .bitset => frozenBitsetIntersectBitsetCard(a_data, b_data),
+            .run => frozenBitsetIntersectRunCard(a_data, b_data),
+        },
+        .run => switch (b_kind) {
+            .array => frozenArrayIntersectRunCard(b_data, b_card, a_data),
+            .bitset => frozenBitsetIntersectRunCard(b_data, a_data),
+            .run => frozenRunIntersectRunCard(a_data, b_data),
+        },
+    };
+}
+
+/// Return true if a ∩ b is non-empty for two frozen containers. Early exit.
+pub fn frozenContainerIntersects(
+    a_kind: FrozenContainerKind,
+    a_data: []const u8,
+    a_card: u32,
+    b_kind: FrozenContainerKind,
+    b_data: []const u8,
+    b_card: u32,
+) bool {
+    return switch (a_kind) {
+        .array => switch (b_kind) {
+            .array => frozenArrayIntersectsArray(a_data, a_card, b_data, b_card),
+            .bitset => frozenArrayIntersectsBitset(a_data, a_card, b_data),
+            .run => frozenArrayIntersectsRun(a_data, a_card, b_data),
+        },
+        .bitset => switch (b_kind) {
+            .array => frozenArrayIntersectsBitset(b_data, b_card, a_data),
+            .bitset => frozenBitsetIntersectsBitset(a_data, b_data),
+            .run => frozenBitsetIntersectsRun(a_data, b_data),
+        },
+        .run => switch (b_kind) {
+            .array => frozenArrayIntersectsRun(b_data, b_card, a_data),
+            .bitset => frozenBitsetIntersectsRun(b_data, a_data),
+            .run => frozenRunIntersectsRun(a_data, b_data),
+        },
+    };
+}
+
+// -- Frozen intersection cardinality helpers --
+
+fn frozenArrayIntersectArrayCard(a_data: []const u8, a_card: u32, b_data: []const u8, b_card: u32) u64 {
+    const small_data = if (a_card <= b_card) a_data else b_data;
+    const small_card = if (a_card <= b_card) a_card else b_card;
+    const big_data = if (a_card <= b_card) b_data else a_data;
+    const big_card = if (a_card <= b_card) b_card else a_card;
+
+    var count: u64 = 0;
+    var lo: usize = 0;
+    for (0..small_card) |i| {
+        const val = readFrozenU16(small_data, i);
+        lo = frozenGallopSearch(big_data, big_card, val, lo);
+        if (lo < big_card and readFrozenU16(big_data, lo) == val) {
+            count += 1;
+            lo += 1;
+        }
+    }
+    return count;
+}
+
+fn frozenArrayIntersectBitsetCard(arr_data: []const u8, arr_card: u32, bs_data: []const u8) u64 {
+    var count: u64 = 0;
+    for (0..arr_card) |i| {
+        const v = readFrozenU16(arr_data, i);
+        const word_idx = v >> 6;
+        const bit: u6 = @truncate(v);
+        const word = readFrozenWord(bs_data, word_idx);
+        if ((word & (@as(u64, 1) << bit)) != 0) count += 1;
+    }
+    return count;
+}
+
+fn frozenArrayIntersectRunCard(arr_data: []const u8, arr_card: u32, run_data: []const u8) u64 {
+    const n_runs = readFrozenU16(run_data, 0);
+    var count: u64 = 0;
+    for (0..arr_card) |i| {
+        const v = readFrozenU16(arr_data, i);
+        if (frozenRunContains(run_data, n_runs, v)) count += 1;
+    }
+    return count;
+}
+
+fn frozenBitsetIntersectBitsetCard(a_data: []const u8, b_data: []const u8) u64 {
+    const VEC_SIZE = 8;
+    const vec_count = 1024 / VEC_SIZE;
+    var card: u64 = 0;
+    for (0..vec_count) |i| {
+        const base = i * VEC_SIZE;
+        var va: @Vector(VEC_SIZE, u64) = undefined;
+        var vb: @Vector(VEC_SIZE, u64) = undefined;
+        inline for (0..VEC_SIZE) |j| {
+            va[j] = readFrozenWord(a_data, base + j);
+            vb[j] = readFrozenWord(b_data, base + j);
+        }
+        const result = va & vb;
+        inline for (0..VEC_SIZE) |j| {
+            card += @popCount(result[j]);
+        }
+    }
+    return card;
+}
+
+fn frozenBitsetIntersectRunCard(bs_data: []const u8, run_data: []const u8) u64 {
+    const VEC_SIZE = 8;
+    const n_runs = readFrozenU16(run_data, 0);
+    var count: u64 = 0;
+    for (0..n_runs) |i| {
+        const offset = 2 + i * 4;
+        const start: u32 = std.mem.readInt(u16, run_data[offset..][0..2], .little);
+        const length: u32 = std.mem.readInt(u16, run_data[offset + 2 ..][0..2], .little);
+        const end = start + length; // inclusive
+
+        const first_word = start >> 6;
+        const last_word = end >> 6;
+
+        if (first_word == last_word) {
+            // Run fits in a single word — mask the relevant bit range
+            const lo_bit: u6 = @truncate(start);
+            const hi_bit: u6 = @truncate(end);
+            const mask = ((@as(u64, 1) << hi_bit) << 1 -| 1) & ~((@as(u64, 1) << lo_bit) -| 1);
+            count += @popCount(readFrozenWord(bs_data, first_word) & mask);
+        } else {
+            // Partial first word
+            const lo_bit: u6 = @truncate(start);
+            const first_mask: u64 = ~((@as(u64, 1) << lo_bit) -| 1); // bits [lo_bit..63]
+            count += @popCount(readFrozenWord(bs_data, first_word) & first_mask);
+
+            // Full middle words — vectorized popcount
+            var w = first_word + 1;
+            while (w + VEC_SIZE <= last_word) : (w += VEC_SIZE) {
+                var vec: @Vector(VEC_SIZE, u64) = undefined;
+                inline for (0..VEC_SIZE) |j| {
+                    vec[j] = readFrozenWord(bs_data, w + j);
+                }
+                inline for (0..VEC_SIZE) |j| {
+                    count += @popCount(vec[j]);
+                }
+            }
+            // Scalar tail
+            while (w < last_word) : (w += 1) {
+                count += @popCount(readFrozenWord(bs_data, w));
+            }
+
+            // Partial last word
+            const hi_bit: u6 = @truncate(end);
+            const last_mask: u64 = (@as(u64, 1) << hi_bit) << 1 -| 1; // bits [0..hi_bit]
+            count += @popCount(readFrozenWord(bs_data, last_word) & last_mask);
+        }
+    }
+    return count;
+}
+
+fn frozenRunIntersectRunCard(a_run_data: []const u8, b_run_data: []const u8) u64 {
+    const a_n_runs = readFrozenU16(a_run_data, 0);
+    const b_n_runs = readFrozenU16(b_run_data, 0);
+
+    var i: usize = 0;
+    var j: usize = 0;
+    var count: u64 = 0;
+    while (i < a_n_runs and j < b_n_runs) {
+        const a_offset = 2 + i * 4;
+        const b_offset = 2 + j * 4;
+        const a_start: u32 = std.mem.readInt(u16, a_run_data[a_offset..][0..2], .little);
+        const a_length: u32 = std.mem.readInt(u16, a_run_data[a_offset + 2 ..][0..2], .little);
+        const a_end = a_start + a_length;
+        const b_start: u32 = std.mem.readInt(u16, b_run_data[b_offset..][0..2], .little);
+        const b_length: u32 = std.mem.readInt(u16, b_run_data[b_offset + 2 ..][0..2], .little);
+        const b_end = b_start + b_length;
+
+        if (a_start <= b_end and b_start <= a_end) {
+            const lo = @max(a_start, b_start);
+            const hi = @min(a_end, b_end);
+            count += @as(u64, hi - lo) + 1;
+        }
+
+        if (a_end <= b_end) i += 1 else j += 1;
+    }
+    return count;
+}
+
+// -- Frozen intersects (early-exit) helpers --
+
+fn frozenArrayIntersectsArray(a_data: []const u8, a_card: u32, b_data: []const u8, b_card: u32) bool {
+    const small_data = if (a_card <= b_card) a_data else b_data;
+    const small_card = if (a_card <= b_card) a_card else b_card;
+    const big_data = if (a_card <= b_card) b_data else a_data;
+    const big_card = if (a_card <= b_card) b_card else a_card;
+
+    var lo: usize = 0;
+    for (0..small_card) |i| {
+        const val = readFrozenU16(small_data, i);
+        lo = frozenGallopSearch(big_data, big_card, val, lo);
+        if (lo < big_card and readFrozenU16(big_data, lo) == val) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn frozenArrayIntersectsBitset(arr_data: []const u8, arr_card: u32, bs_data: []const u8) bool {
+    for (0..arr_card) |i| {
+        const v = readFrozenU16(arr_data, i);
+        const word_idx = v >> 6;
+        const bit: u6 = @truncate(v);
+        const word = readFrozenWord(bs_data, word_idx);
+        if ((word & (@as(u64, 1) << bit)) != 0) return true;
+    }
+    return false;
+}
+
+fn frozenArrayIntersectsRun(arr_data: []const u8, arr_card: u32, run_data: []const u8) bool {
+    const n_runs = readFrozenU16(run_data, 0);
+    for (0..arr_card) |i| {
+        const v = readFrozenU16(arr_data, i);
+        if (frozenRunContains(run_data, n_runs, v)) return true;
+    }
+    return false;
+}
+
+fn frozenBitsetIntersectsBitset(a_data: []const u8, b_data: []const u8) bool {
+    for (0..BitsetContainer.NUM_WORDS) |i| {
+        if (readFrozenWord(a_data, i) & readFrozenWord(b_data, i) != 0) return true;
+    }
+    return false;
+}
+
+fn frozenBitsetIntersectsRun(bs_data: []const u8, run_data: []const u8) bool {
+    const n_runs = readFrozenU16(run_data, 0);
+    for (0..n_runs) |i| {
+        const offset = 2 + i * 4;
+        const start: u32 = std.mem.readInt(u16, run_data[offset..][0..2], .little);
+        const length: u32 = std.mem.readInt(u16, run_data[offset + 2 ..][0..2], .little);
+        const end = start + length;
+
+        const first_word = start >> 6;
+        const last_word = end >> 6;
+
+        if (first_word == last_word) {
+            const lo_bit: u6 = @truncate(start);
+            const hi_bit: u6 = @truncate(end);
+            const mask = ((@as(u64, 1) << hi_bit) << 1 -| 1) & ~((@as(u64, 1) << lo_bit) -| 1);
+            if (readFrozenWord(bs_data, first_word) & mask != 0) return true;
+        } else {
+            const lo_bit: u6 = @truncate(start);
+            const first_mask: u64 = ~((@as(u64, 1) << lo_bit) -| 1);
+            if (readFrozenWord(bs_data, first_word) & first_mask != 0) return true;
+
+            var w = first_word + 1;
+            while (w < last_word) : (w += 1) {
+                if (readFrozenWord(bs_data, w) != 0) return true;
+            }
+
+            const hi_bit: u6 = @truncate(end);
+            const last_mask: u64 = (@as(u64, 1) << hi_bit) << 1 -| 1;
+            if (readFrozenWord(bs_data, last_word) & last_mask != 0) return true;
+        }
+    }
+    return false;
+}
+
+fn frozenRunIntersectsRun(a_run_data: []const u8, b_run_data: []const u8) bool {
+    const a_n_runs = readFrozenU16(a_run_data, 0);
+    const b_n_runs = readFrozenU16(b_run_data, 0);
+
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a_n_runs and j < b_n_runs) {
+        const a_offset = 2 + i * 4;
+        const b_offset = 2 + j * 4;
+        const a_start: u32 = std.mem.readInt(u16, a_run_data[a_offset..][0..2], .little);
+        const a_length: u32 = std.mem.readInt(u16, a_run_data[a_offset + 2 ..][0..2], .little);
+        const a_end = a_start + a_length;
+        const b_start: u32 = std.mem.readInt(u16, b_run_data[b_offset..][0..2], .little);
+        const b_length: u32 = std.mem.readInt(u16, b_run_data[b_offset + 2 ..][0..2], .little);
+        const b_end = b_start + b_length;
+
+        if (a_start <= b_end and b_start <= a_end) {
+            return true;
+        }
+
+        if (a_end <= b_end) i += 1 else j += 1;
+    }
+    return false;
+}
+
+// ============================================================================
 // Difference (AND NOT)
 // ============================================================================
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const fmt = @import("format.zig");
 const ArrayContainer = @import("array_container.zig").ArrayContainer;
 const BitsetContainer = @import("bitset_container.zig").BitsetContainer;
+const ops = @import("container_ops.zig");
 
 /// A read-only bitmap view over serialized bytes. Zero-copy - no allocation for container data.
 /// Use this for zero-copy reads from mmap'd LMDB values.
@@ -230,6 +231,76 @@ pub const FrozenBitmap = struct {
             total += self.getCardinality(i);
         }
         return total;
+    }
+
+    /// Determine the container kind at the given index.
+    fn getContainerKind(self: *const Self, idx: usize) ops.FrozenContainerKind {
+        if (self.isRunContainer(idx)) return .run;
+        if (self.getCardinality(idx) > ArrayContainer.MAX_CARDINALITY) return .bitset;
+        return .array;
+    }
+
+    /// Get a byte slice for the container data at index.
+    fn getContainerDataSlice(self: *const Self, idx: usize) []const u8 {
+        const offset = self.getContainerDataOffset(idx);
+        const size = self.getContainerSize(idx);
+        return self.data[offset .. offset + size];
+    }
+
+    /// Compute |self ∩ other| without any allocation.
+    /// Uses container-level frozen intersection on serialized bytes.
+    pub fn andCardinality(self: *const Self, other: *const Self) u64 {
+        var total: u64 = 0;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < self.size and j < other.size) {
+            const k_self = self.getKey(i);
+            const k_other = other.getKey(j);
+            if (k_self < k_other) {
+                i += 1;
+            } else if (k_self > k_other) {
+                j += 1;
+            } else {
+                total += ops.frozenContainerIntersectionCardinality(
+                    self.getContainerKind(i),
+                    self.getContainerDataSlice(i),
+                    self.getCardinality(i),
+                    other.getContainerKind(j),
+                    other.getContainerDataSlice(j),
+                    other.getCardinality(j),
+                );
+                i += 1;
+                j += 1;
+            }
+        }
+        return total;
+    }
+
+    /// Return true if self ∩ other is non-empty. Early exit on first match.
+    pub fn intersects(self: *const Self, other: *const Self) bool {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < self.size and j < other.size) {
+            const k_self = self.getKey(i);
+            const k_other = other.getKey(j);
+            if (k_self < k_other) {
+                i += 1;
+            } else if (k_self > k_other) {
+                j += 1;
+            } else {
+                if (ops.frozenContainerIntersects(
+                    self.getContainerKind(i),
+                    self.getContainerDataSlice(i),
+                    self.getCardinality(i),
+                    other.getContainerKind(j),
+                    other.getContainerDataSlice(j),
+                    other.getCardinality(j),
+                )) return true;
+                i += 1;
+                j += 1;
+            }
+        }
+        return false;
     }
 
     /// Iterator over all values in the frozen bitmap.
@@ -519,4 +590,284 @@ test "FrozenBitmap iterator" {
         idx += 1;
     }
     try std.testing.expectEqual(values.len, idx);
+}
+
+// ============================================================================
+// andCardinality / intersects tests
+// ============================================================================
+
+test "FrozenBitmap andCardinality: array × array" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.add(1);
+    _ = try a.add(2);
+    _ = try a.add(3);
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.add(2);
+    _ = try b.add(3);
+    _ = try b.add(4);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    try std.testing.expectEqual(@as(u64, 2), fa.andCardinality(&fb));
+    try std.testing.expectEqual(@as(u64, 2), fb.andCardinality(&fa)); // commutative
+}
+
+test "FrozenBitmap intersects: array × array" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.add(1);
+    _ = try a.add(2);
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.add(2);
+    _ = try b.add(3);
+
+    var c = try RoaringBitmap.init(allocator);
+    defer c.deinit();
+    _ = try c.add(10);
+    _ = try c.add(20);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+    const sc = try c.serialize(allocator);
+    defer allocator.free(sc);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+    const fc = try FrozenBitmap.init(sc);
+
+    try std.testing.expect(fa.intersects(&fb)); // overlap at 2
+    try std.testing.expect(!fa.intersects(&fc)); // disjoint
+}
+
+test "FrozenBitmap andCardinality: bitset × bitset" {
+    const allocator = std.testing.allocator;
+
+    // >4096 values → bitset containers
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.addRange(0, 5000);
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(3000, 8000);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    // Overlap is [3000, 5000] → 2001 values
+    try std.testing.expectEqual(@as(u64, 2001), fa.andCardinality(&fb));
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: array × bitset" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.add(100);
+    _ = try a.add(200);
+    _ = try a.add(9999);
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(0, 5000);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    // 100 and 200 are in [0,5000], 9999 is not
+    try std.testing.expectEqual(@as(u64, 2), fa.andCardinality(&fb));
+    try std.testing.expectEqual(@as(u64, 2), fb.andCardinality(&fa)); // commutative
+}
+
+test "FrozenBitmap andCardinality: with run containers" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.addRange(100, 300);
+    _ = try a.runOptimize();
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(200, 400);
+    _ = try b.runOptimize();
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    // Overlap is [200, 300] → 101 values
+    try std.testing.expectEqual(@as(u64, 101), fa.andCardinality(&fb));
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: array × run" {
+    const allocator = std.testing.allocator;
+
+    // a: sparse array container (no runOptimize)
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.add(150);
+    _ = try a.add(250);
+    _ = try a.add(999);
+
+    // b: run container (contiguous range + runOptimize)
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(100, 200);
+    _ = try b.runOptimize();
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    // 150 is in [100,200]; 250 and 999 are not.
+    try std.testing.expectEqual(@as(u64, 1), fa.andCardinality(&fb));
+    try std.testing.expectEqual(@as(u64, 1), fb.andCardinality(&fa)); // commutative
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: bitset × run" {
+    const allocator = std.testing.allocator;
+
+    // a: bitset container (>4096 values, no runOptimize)
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.addRange(0, 5000);
+
+    // b: run container (small range + runOptimize)
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(4900, 5100);
+    _ = try b.runOptimize();
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    // a has [0,5000], b has [4900,5100]. Overlap is [4900,5000] = 101 values.
+    try std.testing.expectEqual(@as(u64, 101), fa.andCardinality(&fb));
+    try std.testing.expectEqual(@as(u64, 101), fb.andCardinality(&fa)); // commutative
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: empty bitmaps" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.add(42);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    try std.testing.expectEqual(@as(u64, 0), fa.andCardinality(&fb));
+    try std.testing.expectEqual(@as(u64, 0), fb.andCardinality(&fa));
+    try std.testing.expect(!fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: multi-container" {
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.add(100); // chunk 0
+    _ = try a.add(65536 + 50); // chunk 1
+    _ = try a.add(131072 + 25); // chunk 2
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.add(100); // chunk 0 — matches
+    _ = try b.add(65536 + 99); // chunk 1 — no match
+    _ = try b.add(196608 + 1); // chunk 3 — no matching container
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    try std.testing.expectEqual(@as(u64, 1), fa.andCardinality(&fb));
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality parity with RoaringBitmap" {
+    // Cross-check: frozen and live RoaringBitmap andCardinality must agree.
+    const allocator = std.testing.allocator;
+
+    var a = try RoaringBitmap.init(allocator);
+    defer a.deinit();
+    _ = try a.addRange(0, 5000);
+    _ = try a.add(65536 + 10);
+    _ = try a.add(65536 + 20);
+    _ = try a.runOptimize();
+
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(4000, 6000);
+    _ = try b.add(65536 + 10);
+    _ = try b.add(131072 + 5);
+    _ = try b.runOptimize();
+
+    const live_card = a.andCardinality(&b);
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    try std.testing.expectEqual(live_card, fa.andCardinality(&fb));
 }
