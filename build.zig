@@ -127,6 +127,8 @@ pub fn build(b: *std.Build) void {
             "src/wasm_interop_module.zig",
             "-target",
             "wasm32-freestanding",
+            "-mcpu",
+            "baseline+simd128",
             "-O",
             "ReleaseFast",
             "-fno-entry",
