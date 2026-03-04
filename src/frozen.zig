@@ -461,6 +461,19 @@ pub const FrozenBitmap = struct {
 
 const RoaringBitmap = @import("bitmap.zig").RoaringBitmap;
 
+fn denseBitmapFromRange(allocator: std.mem.Allocator, lo: u32, hi: u32) !RoaringBitmap {
+    std.debug.assert(lo <= hi);
+    const len: usize = @intCast(hi - lo + 1);
+    const values = try allocator.alloc(u32, len);
+    defer allocator.free(values);
+
+    for (values, 0..) |*slot, i| {
+        slot.* = lo + @as(u32, @intCast(i));
+    }
+
+    return RoaringBitmap.fromSorted(allocator, values);
+}
+
 test "FrozenBitmap from empty bitmap" {
     const allocator = std.testing.allocator;
 
@@ -659,14 +672,12 @@ test "FrozenBitmap intersects: array × array" {
 test "FrozenBitmap andCardinality: bitset × bitset" {
     const allocator = std.testing.allocator;
 
-    // >4096 values → bitset containers
-    var a = try RoaringBitmap.init(allocator);
+    // Build densely via fromSorted to force bitset containers.
+    var a = try denseBitmapFromRange(allocator, 0, 5000);
     defer a.deinit();
-    _ = try a.addRange(0, 5000);
 
-    var b = try RoaringBitmap.init(allocator);
+    var b = try denseBitmapFromRange(allocator, 3000, 8000);
     defer b.deinit();
-    _ = try b.addRange(3000, 8000);
 
     const sa = try a.serialize(allocator);
     defer allocator.free(sa);
@@ -690,9 +701,8 @@ test "FrozenBitmap andCardinality: array × bitset" {
     _ = try a.add(200);
     _ = try a.add(9999);
 
-    var b = try RoaringBitmap.init(allocator);
+    var b = try denseBitmapFromRange(allocator, 0, 5000);
     defer b.deinit();
-    _ = try b.addRange(0, 5000);
 
     const sa = try a.serialize(allocator);
     defer allocator.free(sa);
@@ -766,10 +776,9 @@ test "FrozenBitmap andCardinality: array × run" {
 test "FrozenBitmap andCardinality: bitset × run" {
     const allocator = std.testing.allocator;
 
-    // a: bitset container (>4096 values, no runOptimize)
-    var a = try RoaringBitmap.init(allocator);
+    // a: true bitset container (forced via fromSorted dense input)
+    var a = try denseBitmapFromRange(allocator, 0, 5000);
     defer a.deinit();
-    _ = try a.addRange(0, 5000);
 
     // b: run container (small range + runOptimize)
     var b = try RoaringBitmap.init(allocator);
@@ -788,6 +797,32 @@ test "FrozenBitmap andCardinality: bitset × run" {
     // a has [0,5000], b has [4900,5100]. Overlap is [4900,5000] = 101 values.
     try std.testing.expectEqual(@as(u64, 101), fa.andCardinality(&fb));
     try std.testing.expectEqual(@as(u64, 101), fb.andCardinality(&fa)); // commutative
+    try std.testing.expect(fa.intersects(&fb));
+}
+
+test "FrozenBitmap andCardinality: bitset × run same-word boundary regression" {
+    const allocator = std.testing.allocator;
+
+    // a: true bitset container with dense values in one chunk.
+    var a = try denseBitmapFromRange(allocator, 0, 5000);
+    defer a.deinit();
+
+    // b: run constrained to one machine word [0..63].
+    var b = try RoaringBitmap.init(allocator);
+    defer b.deinit();
+    _ = try b.addRange(0, 63);
+    _ = try b.runOptimize();
+
+    const sa = try a.serialize(allocator);
+    defer allocator.free(sa);
+    const sb = try b.serialize(allocator);
+    defer allocator.free(sb);
+
+    const fa = try FrozenBitmap.init(sa);
+    const fb = try FrozenBitmap.init(sb);
+
+    const live = a.andCardinality(&b);
+    try std.testing.expectEqual(live, fa.andCardinality(&fb));
     try std.testing.expect(fa.intersects(&fb));
 }
 

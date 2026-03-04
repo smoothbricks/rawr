@@ -688,6 +688,14 @@ inline fn readFrozenWord(data: []const u8, word_idx: usize) u64 {
     return std.mem.readInt(u64, data[offset..][0..8], .little);
 }
 
+/// Build an inclusive bit mask covering [lo_bit, hi_bit] within a u64 word.
+inline fn frozenInclusiveWordMask(lo_bit: u6, hi_bit: u6) u64 {
+    const all_ones: u64 = std.math.maxInt(u64);
+    const ones_to_hi: u64 = all_ones >> (@as(u6, 63) - hi_bit);
+    const ones_from_lo: u64 = all_ones << lo_bit;
+    return ones_to_hi & ones_from_lo;
+}
+
 /// Gallop search on a frozen (serialized) sorted u16 array.
 /// Returns the index of the first element >= target.
 fn frozenGallopSearch(data: []const u8, card: u32, target: u16, start: usize) usize {
@@ -873,7 +881,7 @@ fn frozenBitsetIntersectRunCard(bs_data: []const u8, run_data: []const u8) u64 {
             // Run fits in a single word — mask the relevant bit range
             const lo_bit: u6 = @truncate(start);
             const hi_bit: u6 = @truncate(end);
-            const mask = ((@as(u64, 1) << hi_bit) << 1 -| 1) & ~((@as(u64, 1) << lo_bit) -| 1);
+            const mask = frozenInclusiveWordMask(lo_bit, hi_bit);
             count += @popCount(readFrozenWord(bs_data, first_word) & mask);
         } else {
             // Partial first word
@@ -899,7 +907,7 @@ fn frozenBitsetIntersectRunCard(bs_data: []const u8, run_data: []const u8) u64 {
 
             // Partial last word
             const hi_bit: u6 = @truncate(end);
-            const last_mask: u64 = (@as(u64, 1) << hi_bit) << 1 -| 1; // bits [0..hi_bit]
+            const last_mask: u64 = frozenInclusiveWordMask(0, hi_bit); // bits [0..hi_bit]
             count += @popCount(readFrozenWord(bs_data, last_word) & last_mask);
         }
     }
@@ -994,7 +1002,7 @@ fn frozenBitsetIntersectsRun(bs_data: []const u8, run_data: []const u8) bool {
         if (first_word == last_word) {
             const lo_bit: u6 = @truncate(start);
             const hi_bit: u6 = @truncate(end);
-            const mask = ((@as(u64, 1) << hi_bit) << 1 -| 1) & ~((@as(u64, 1) << lo_bit) -| 1);
+            const mask = frozenInclusiveWordMask(lo_bit, hi_bit);
             if (readFrozenWord(bs_data, first_word) & mask != 0) return true;
         } else {
             const lo_bit: u6 = @truncate(start);
@@ -1007,7 +1015,7 @@ fn frozenBitsetIntersectsRun(bs_data: []const u8, run_data: []const u8) bool {
             }
 
             const hi_bit: u6 = @truncate(end);
-            const last_mask: u64 = (@as(u64, 1) << hi_bit) << 1 -| 1;
+            const last_mask: u64 = frozenInclusiveWordMask(0, hi_bit);
             if (readFrozenWord(bs_data, last_word) & last_mask != 0) return true;
         }
     }
