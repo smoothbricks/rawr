@@ -32,13 +32,9 @@ fn buildFixtureBitmap(bm: *RoaringBitmap) !void {
     _ = try bm.runOptimize();
 }
 
-fn serializeIntoOutput(bm: *const RoaringBitmap, allocator: std.mem.Allocator) !u32 {
-    const bytes = try bm.serialize(allocator);
-    defer allocator.free(bytes);
-
-    if (bytes.len > OUTPUT_CAPACITY) return error.OutputTooLarge;
-    @memcpy(output_buf[0..bytes.len], bytes);
-    return @intCast(bytes.len);
+fn serializeIntoOutput(bm: *const RoaringBitmap) !u32 {
+    const out_len = try bm.serializeIntoBuffer(output_buf[0..]);
+    return @intCast(out_len);
 }
 
 pub export fn rawr_input_ptr() u32 {
@@ -64,7 +60,7 @@ pub export fn rawr_fixture_serialize() u32 {
     defer bm.deinit();
 
     buildFixtureBitmap(&bm) catch return 0;
-    return serializeIntoOutput(&bm, allocator) catch 0;
+    return serializeIntoOutput(&bm) catch 0;
 }
 
 pub export fn rawr_roundtrip_input(input_len: u32) u32 {
@@ -74,5 +70,5 @@ pub export fn rawr_roundtrip_input(input_len: u32) u32 {
     var bm = RoaringBitmap.deserialize(allocator, input_buf[0..input_len]) catch return 0;
     defer bm.deinit();
 
-    return serializeIntoOutput(&bm, allocator) catch 0;
+    return serializeIntoOutput(&bm) catch 0;
 }
