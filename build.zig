@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const wasm_simd_features = std.Target.wasm.featureSet(&.{.simd128});
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = wasm_simd_features,
+    });
     const is_wasm_freestanding =
         (target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64) and
         target.result.os.tag == .freestanding;
@@ -120,21 +126,25 @@ pub fn build(b: *std.Build) void {
         // wasm/native interop validation:
         // 1) build wasm module that emits/consumes portable bytes
         // 2) run native CRoaring checker against wasm-produced behavior
-        const wasm_interop_wasm = ".zig-cache/rawr_wasm_interop.wasm";
-        const build_wasm_cmd = b.addSystemCommand(&.{
-            "zig",
-            "build-exe",
-            "src/wasm_interop_module.zig",
-            "-target",
-            "wasm32-freestanding",
-            "-mcpu",
-            "baseline+simd128",
-            "-O",
-            "ReleaseFast",
-            "-fno-entry",
-            "-rdynamic",
-            "-femit-bin=" ++ wasm_interop_wasm,
+        const wasm_interop_exe = b.addExecutable(.{
+            .name = "rawr_wasm_interop",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/wasm_interop_module.zig"),
+                .target = wasm_target,
+                .optimize = .ReleaseFast,
+            }),
         });
+        wasm_interop_exe.entry = .disabled;
+        wasm_interop_exe.rdynamic = true;
+        wasm_interop_exe.export_memory = true;
+
+        const wasm_interop_subpath = ".zig-cache/rawr_wasm_interop.wasm";
+        const install_wasm_interop = b.addInstallFileWithDir(
+            wasm_interop_exe.getEmittedBin(),
+            .prefix,
+            wasm_interop_subpath,
+        );
+        const wasm_interop_wasm = b.getInstallPath(.prefix, wasm_interop_subpath);
 
         const validate_wasm_mod = b.createModule(.{
             .root_source_file = b.path("src/validate_wasm_interop.zig"),
@@ -155,7 +165,7 @@ pub fn build(b: *std.Build) void {
 
         const run_validate_wasm = b.addRunArtifact(validate_wasm_exe);
         run_validate_wasm.addArg(wasm_interop_wasm);
-        run_validate_wasm.step.dependOn(&build_wasm_cmd.step);
+        run_validate_wasm.step.dependOn(&install_wasm_interop.step);
 
         const wasm_interop_step = b.step("wasm-interop", "Run wasm rawr/native CRoaring interop validation");
         wasm_interop_step.dependOn(&run_validate_wasm.step);

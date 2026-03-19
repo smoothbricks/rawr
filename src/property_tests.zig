@@ -1,9 +1,9 @@
 const std = @import("std");
 const RoaringBitmap = @import("bitmap.zig").RoaringBitmap;
+const FrozenBitmap = @import("frozen.zig").FrozenBitmap;
 
 /// Property-based tests verifying set algebra axioms.
 /// Uses random bitmaps and checks algebraic identities.
-
 fn randomBitmap(allocator: std.mem.Allocator, rng: std.Random, max_values: usize) !RoaringBitmap {
     var bm = try RoaringBitmap.init(allocator);
     errdefer bm.deinit();
@@ -19,6 +19,58 @@ fn randomBitmap(allocator: std.mem.Allocator, rng: std.Random, max_values: usize
 fn expectBitmapEqual(a: *const RoaringBitmap, b: *const RoaringBitmap) !void {
     if (!a.equals(b)) {
         return error.BitmapsNotEqual;
+    }
+}
+
+fn denseBitmapFromRange(allocator: std.mem.Allocator, lo: u32, hi: u32) !RoaringBitmap {
+    std.debug.assert(lo <= hi);
+    const len: usize = @intCast(hi - lo + 1);
+    const values = try allocator.alloc(u32, len);
+    defer allocator.free(values);
+
+    for (values, 0..) |*slot, i| {
+        slot.* = lo + @as(u32, @intCast(i));
+    }
+
+    return RoaringBitmap.fromSorted(allocator, values);
+}
+
+fn randomShapedBitmap(allocator: std.mem.Allocator, rng: std.Random) !RoaringBitmap {
+    switch (rng.uintLessThan(u8, 4)) {
+        0 => return randomBitmap(allocator, rng, 200),
+        1 => {
+            const hi_start = std.math.maxInt(u32) - 7000;
+            const lo = rng.intRangeAtMost(u32, 0, hi_start);
+            const len = rng.intRangeAtMost(u32, 4500, 7000);
+            return denseBitmapFromRange(allocator, lo, lo + len);
+        },
+        2 => {
+            var bm = try RoaringBitmap.init(allocator);
+            errdefer bm.deinit();
+
+            const base = @as(u32, rng.intRangeLessThan(u16, 0, std.math.maxInt(u16))) << 16;
+            const run_count = rng.intRangeAtMost(u8, 1, 5);
+            for (0..run_count) |_| {
+                const start = rng.intRangeAtMost(u16, 0, 65000);
+                const len = rng.intRangeAtMost(u16, 1, 400);
+                const end = @min(@as(u32, start) + len, @as(u32, std.math.maxInt(u16)));
+                _ = try bm.addRange(base + start, base + end);
+            }
+            _ = try bm.runOptimize();
+            return bm;
+        },
+        else => {
+            var bm = try randomBitmap(allocator, rng, 120);
+            errdefer bm.deinit();
+
+            const hi_start = std.math.maxInt(u32) - 5000;
+            const lo = rng.intRangeAtMost(u32, 0, hi_start);
+            _ = try bm.addRange(lo, lo + rng.intRangeAtMost(u32, 256, 5000));
+            if (rng.boolean()) {
+                _ = try bm.runOptimize();
+            }
+            return bm;
+        },
     }
 }
 
@@ -361,5 +413,72 @@ test "absorption: A ∪ (A ∩ B) = A" {
         defer result.deinit();
 
         try expectBitmapEqual(&a, &result);
+    }
+}
+
+test "frozen intersection parity: randomized live vs serialized" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(12361);
+    const rng = prng.random();
+
+    for (0..80) |_| {
+        var a = try randomShapedBitmap(allocator, rng);
+        defer a.deinit();
+        var b = try randomShapedBitmap(allocator, rng);
+        defer b.deinit();
+
+        const live_card = a.andCardinality(&b);
+        const live_intersects = a.intersects(&b);
+
+        var live_and = try a.bitwiseAnd(allocator, &b);
+        defer live_and.deinit();
+        try std.testing.expectEqual(live_card, live_and.cardinality());
+        try std.testing.expectEqual(live_intersects, !live_and.isEmpty());
+
+        const sa = try a.serialize(allocator);
+        defer allocator.free(sa);
+        const sb = try b.serialize(allocator);
+        defer allocator.free(sb);
+
+        const fa = try FrozenBitmap.init(sa);
+        const fb = try FrozenBitmap.init(sb);
+
+        try std.testing.expectEqual(live_card, fa.andCardinality(&fb));
+        try std.testing.expectEqual(live_card, fb.andCardinality(&fa));
+        try std.testing.expectEqual(live_intersects, fa.intersects(&fb));
+        try std.testing.expectEqual(live_intersects, fb.intersects(&fa));
+    }
+}
+
+test "frozen intersection parity: same-word run masks stay exact" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(12362);
+    const rng = prng.random();
+
+    for (0..80) |_| {
+        var bitset = try denseBitmapFromRange(allocator, 0, 5000);
+        defer bitset.deinit();
+
+        var run = try RoaringBitmap.init(allocator);
+        defer run.deinit();
+
+        const start = rng.intRangeAtMost(u16, 0, 4999);
+        const len = rng.intRangeAtMost(u16, 0, @min(@as(u16, 63), @as(u16, 5000 - start)));
+        _ = try run.addRange(start, start + len);
+        _ = try run.runOptimize();
+
+        const live_card = bitset.andCardinality(&run);
+        const live_intersects = bitset.intersects(&run);
+
+        const s_bitset = try bitset.serialize(allocator);
+        defer allocator.free(s_bitset);
+        const s_run = try run.serialize(allocator);
+        defer allocator.free(s_run);
+
+        const f_bitset = try FrozenBitmap.init(s_bitset);
+        const f_run = try FrozenBitmap.init(s_run);
+
+        try std.testing.expectEqual(live_card, f_bitset.andCardinality(&f_run));
+        try std.testing.expectEqual(live_intersects, f_bitset.intersects(&f_run));
     }
 }
