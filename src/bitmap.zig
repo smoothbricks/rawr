@@ -1387,7 +1387,8 @@ pub const RoaringBitmap = struct {
 
     /// Serialize to any writer.
     pub fn serializeToWriter(self: *const Self, writer: anytype) !void {
-        return ser.serializeToWriter(self, writer);
+        var w = writer;
+        return ser.serializeToWriter(self, &w);
     }
 
     /// Serialize into a caller-provided buffer.
@@ -1396,8 +1397,8 @@ pub const RoaringBitmap = struct {
         const required = ser.serializedSizeInBytes(self);
         if (out.len < required) return error.NoSpaceLeft;
 
-        var stream = std.io.fixedBufferStream(out[0..required]);
-        try ser.serializeToWriter(self, stream.writer());
+        var writer = std.Io.Writer.fixed(out[0..required]);
+        try ser.serializeToWriter(self, &writer);
         return required;
     }
 
@@ -1426,7 +1427,8 @@ pub const RoaringBitmap = struct {
     ///
     /// See `deserialize` for performance notes on arena allocation.
     pub fn deserializeFromReader(allocator: std.mem.Allocator, reader: anytype, data_len: usize) !Self {
-        return ser.deserializeFromReader(allocator, reader, data_len);
+        var r = reader;
+        return ser.deserializeFromReader(allocator, &r, data_len);
     }
 
     // =========================================================================
